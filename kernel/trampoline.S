@@ -26,14 +26,9 @@ uservec:
         # user page table.
         #
 
-        # save user a0 in sscratch so
-        # a0 can be used to get at TRAPFRAME.
-        csrw sscratch, a0
 
-        # each process has a separate p->trapframe memory area,
-        # but it's mapped to the same virtual address
-        # (TRAPFRAME) in every process's user page table.
-        li a0, TRAPFRAME
+        # swap user a0 with the thread-specific trap-frame address
+        csrrw a0, sscratch, a0
         
         # save the user registers in TRAPFRAME
         sd ra, 40(a0)
@@ -99,17 +94,16 @@ uservec:
 
 .globl userret
 userret:
-        # userret(pagetable)
-        # called by usertrapret() in trap.c to
-        # switch from kernel to user.
-        # a0: user page table, for satp.
+        # userret(trapframe, pagetable)
+        # a0: thread-specific trapframe virutal address.
+	# a1: user page table, for satp.
 
         # switch to the user page table.
         sfence.vma zero, zero
-        csrw satp, a0
+        csrw satp, a1
         sfence.vma zero, zero
 
-        li a0, TRAPFRAME
+        csrw sscratch, a0
 
         # restore all but a0 from TRAPFRAME
         ld ra, 40(a0)

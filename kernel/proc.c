@@ -116,6 +116,7 @@ allocproc(void)
     if(p->state == UNUSED) {
       goto found;
     } else {
+      p->thread_id = 0;
       release(&p->lock);
     }
   }
@@ -123,6 +124,7 @@ allocproc(void)
 
 found:
   p->pid = allocpid();
+  p->thread_id = 0;
   p->state = USED;
 
   // Allocate a trapframe page.
@@ -149,20 +151,29 @@ found:
   return p;
 }
 
-// free a proc structure and the data hanging from it,
-// including user pages.
-// p->lock must be held.
+
+
+// updated freeproc
 static void
 freeproc(struct proc *p)
 {
+  if(p->pagetable) {
+    if(p->thread_id == 0)
+      proc_freepagetable(p->pagetable, p->sz);
+    else
+      uvmunmap(p->pagetable,
+               TRAPFRAME - PGSIZE * p->thread_id,
+               1, 0);
+  }
+  
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
-  if(p->pagetable)
-    proc_freepagetable(p->pagetable, p->sz);
+
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
+  p->thread_id = 0;
   p->parent = 0;
   p->name[0] = 0;
   p->chan = 0;
@@ -170,6 +181,10 @@ freeproc(struct proc *p)
   p->xstate = 0;
   p->state = UNUSED;
 }
+
+
+
+
 
 // Create a user page table for a given process, with no user memory,
 // but with trampoline and trapframe pages.
@@ -325,6 +340,106 @@ fork(void)
   return pid;
 }
 
+int
+clone(void *stack)
+{
+
+  if(stack == 0)
+    return -1;
+
+  struct proc *np;
+  struct proc *p = myproc();
+  int id, used;
+  struct proc *pp;
+
+
+  if((np = allocproc()) == 0)
+     return -1;
+
+  proc_freepagetable(np->pagetable, np->sz);
+  np->pagetable = p->pagetable;
+  np->sz = p->sz;
+  //set thread id
+  release(&np->lock);
+  
+  acquire(&wait_lock);
+
+  for(id = 1; id <= 20; id++) {
+    used = 0;
+
+    for(pp = proc; pp < &proc[NPROC]; pp++) {
+      if(pp == np)
+        continue;
+  
+      acquire(&pp->lock);
+  
+      if(pp->parent == p &&
+         pp->thread_id == id &&
+         pp->state != UNUSED)
+        used = 1;
+  
+      release(&pp->lock);
+    }
+  
+    if(!used)
+      break;
+  }
+  
+  if(id <= 20) {
+    acquire(&np->lock);
+    np->thread_id = id;
+    np->parent = p;
+  }
+  
+  release(&wait_lock);
+  
+  if(id > 20) {
+    acquire(&np->lock);
+    np->pagetable = 0;
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
+  //finished setting thread id
+
+  uint64 trapframe_va = TRAPFRAME - PGSIZE * np->thread_id;
+
+  if(mappages(p->pagetable, trapframe_va, PGSIZE,
+              (uint64)np->trapframe, PTE_R | PTE_W) < 0) {
+    np->pagetable = 0;
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
+
+  *(np->trapframe) = *(p->trapframe);
+  np->trapframe->a0 = 0;
+  np->trapframe->sp = (uint64)stack;
+
+  safestrcpy(np->name, p->name, sizeof(p->name));
+  np->cwd = idup(p->cwd);
+  uint64 pid = np->pid;
+
+  //release(&np->lock);
+  
+  //acquire(&wait_lock);
+  //np->parent = p;
+  //release(&wait_lock);
+  
+  printf("clone: created child pid %d, thread id %d\n",
+       np->pid, np->thread_id);
+  //acquire(&np->lock);
+  np->state = RUNNABLE;
+  release(&np->lock);
+
+  return pid;
+
+}
+
+
+
+
+
 // Pass p's abandoned children to init.
 // Caller must hold wait_lock.
 void
@@ -449,7 +564,7 @@ scheduler(void)
   
   c->proc = 0;
   for(;;){
-    // Avoid deadlock by ensuring that devices can interrupt.
+   // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
 
     for(p = proc; p < &proc[NPROC]; p++) {
